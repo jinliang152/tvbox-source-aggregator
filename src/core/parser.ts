@@ -14,7 +14,7 @@ export function normalizeConfig(sourced: SourcedConfig): SourcedConfig {
     config: {
       spider: normalizeSpider(config.spider, sourced.sourceUrl),
       sites: normalizeSites(config.sites || [], config.spider, sourced.sourceUrl),
-      parses: config.parses || [],
+      parses: normalizeParses(config.parses, sourced.sourceUrl),
       lives: normalizeLives(config.lives || [], sourced.sourceUrl),
       hosts: config.hosts || [],
       rules: config.rules || [],
@@ -70,13 +70,42 @@ function normalizeSites(
         normalized.jar = resolveUrl(site.jar, sourceUrl);
       }
 
-      // ext 字段如果是 URL，也做转换
-      if (typeof site.ext === 'string' && site.ext.startsWith('./')) {
-        normalized.ext = resolveUrl(site.ext, sourceUrl);
+      // playUrl 字段：相对路径转绝对
+      if (site.playUrl) {
+        normalized.playUrl = resolveUrl(site.playUrl, sourceUrl);
+      }
+
+      // ext 字段：字符串或对象内部的 URL 都做转换
+      if (site.ext) {
+        normalized.ext = resolveExt(site.ext, sourceUrl);
       }
 
       return normalized;
     });
+}
+
+/**
+ * 处理 ext 字段的 URL 补全
+ * ext 可能是字符串（直接 resolve）或对象（递归 resolve 内部值）
+ */
+function resolveExt(
+  ext: string | Record<string, unknown>,
+  sourceUrl: string,
+): string | Record<string, unknown> {
+  if (typeof ext === 'string') {
+    return isResolvableUrl(ext) ? resolveUrl(ext, sourceUrl) : ext;
+  }
+
+  // ext 是对象，遍历所有值，对字符串类型的 URL 做 resolve
+  const resolved: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(ext)) {
+    if (typeof value === 'string' && isResolvableUrl(value)) {
+      resolved[key] = resolveUrl(value, sourceUrl);
+    } else {
+      resolved[key] = value;
+    }
+  }
+  return resolved;
 }
 
 /**
@@ -122,6 +151,26 @@ function resolveUrl(url: string, baseUrl: string): string {
 }
 
 /**
+ * 规范化解析列表：相对路径转绝对路径
+ */
+function normalizeParses(parses: TVBoxConfig['parses'], sourceUrl: string): TVBoxConfig['parses'] {
+  if (!parses) return [];
+  return parses.map((parse) => {
+    const normalized = { ...parse };
+
+    if (parse.url) {
+      normalized.url = resolveUrl(parse.url, sourceUrl);
+    }
+
+    if (parse.ext) {
+      normalized.ext = resolveExt(parse.ext, sourceUrl);
+    }
+
+    return normalized;
+  });
+}
+
+/**
  * 规范化直播列表：相对路径转绝对路径
  */
 function normalizeLives(lives: TVBoxLive[], sourceUrl: string): TVBoxLive[] {
@@ -132,8 +181,20 @@ function normalizeLives(lives: TVBoxLive[], sourceUrl: string): TVBoxLive[] {
       normalized.url = resolveUrl(live.url, sourceUrl);
     }
 
+    if (live.api) {
+      normalized.api = resolveUrl(live.api, sourceUrl);
+    }
+
     if (live.jar) {
       normalized.jar = resolveUrl(live.jar, sourceUrl);
+    }
+
+    if (live.epg) {
+      normalized.epg = resolveUrl(live.epg, sourceUrl);
+    }
+
+    if (live.ext) {
+      normalized.ext = resolveExt(live.ext, sourceUrl);
     }
 
     return normalized;
