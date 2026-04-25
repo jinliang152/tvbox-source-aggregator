@@ -8,12 +8,13 @@ import { batchSiteSpeedTest, appendSpeedToName, filterUnreachableSites } from '.
 import { macCMSToTVBoxSites, processMacCMSForLocal } from './core/maccms';
 import { rewriteJarUrls } from './core/jar-proxy';
 import { batchTestLiveSources, liveSourcesToTVBoxLives } from './core/live-source';
-import { KV_MERGED_CONFIG, KV_MERGED_CONFIG_FULL, KV_SOURCE_URLS, KV_LAST_UPDATE, KV_MANUAL_SOURCES, KV_MACCMS_SOURCES, KV_LIVE_SOURCES, KV_BLACKLIST, KV_INLINE_PREFIX, KV_NAME_TRANSFORM, KV_SOURCE_HEALTH, KV_SPEED_TEST_ENABLED, KV_JAR_REGISTRY_ENABLED } from './core/config';
+import { KV_MERGED_CONFIG, KV_MERGED_CONFIG_FULL, KV_SOURCE_URLS, KV_LAST_UPDATE, KV_MANUAL_SOURCES, KV_MACCMS_SOURCES, KV_LIVE_SOURCES, KV_BLACKLIST, KV_INLINE_PREFIX, KV_NAME_TRANSFORM, KV_SOURCE_HEALTH, KV_SPEED_TEST_ENABLED, KV_JAR_REGISTRY_ENABLED, KV_EDGE_PROXIES } from './core/config';
 import { loadBlacklist, applyBlacklist, pruneBlacklist, saveBlacklist } from './core/blacklist';
 import { transformSiteNames } from './core/cleaner';
-import { parseConfigJson } from './core/fetcher';
+import { parseConfigJson, type FetchProxyConfig } from './core/fetcher';
 import { buildJarRegistry, assignJars, buildJarStorageAdapter } from './core/jar-registry';
-import type { NameTransformConfig, JarAssignment } from './core/types';
+import { scrapeSourceList } from './core/source-scraper';
+import type { NameTransformConfig, JarAssignment, EdgeProxyConfig } from './core/types';
 
 export async function runAggregation(storage: Storage, config: AppConfig): Promise<void> {
   const startTime = Date.now();
@@ -33,7 +34,39 @@ export async function runAggregation(storage: Storage, config: AppConfig): Promi
 
 async function _runAggregation(storage: Storage, config: AppConfig, startTime: number): Promise<void> {
 
-  // Step 1: 读取手动配置的源
+  // Step 0: 自动抓取源（juwanhezi.com）
+  console.log('[aggregation] Step 0: Auto-scraping sources from juwanhezi.com...');
+  try {
+    const scraped = await scrapeSourceList();
+    if (scraped.length > 0) {
+      // 读取现有手动源
+      const existingRaw = await storage.get(KV_MANUAL_SOURCES);
+      const existingSources: SourceEntry[] = existingRaw ? JSON.parse(existingRaw) : [];
+      const existingUrls = new Set(existingSources.map(s => s.url));
+
+      // 合并：新抓取的源如果不在现有列表中则添加
+      let added = 0;
+      for (const source of scraped) {
+        if (!existingUrls.has(source.url)) {
+          existingSources.push(source);
+          existingUrls.add(source.url);
+          added++;
+        }
+      }
+
+      if (added > 0) {
+        await storage.put(KV_MANUAL_SOURCES, JSON.stringify(existingSources));
+        console.log(`[aggregation] Auto-scraped: ${added} new sources added (total: ${existingSources.length})`);
+      } else {
+        console.log(`[aggregation] Auto-scrape: no new sources (${scraped.length} scraped, all exist)`);
+      }
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[aggregation] Auto-scrape failed (non-blocking): ${msg}`);
+  }
+
+  // Step 1: 读取手动配置的源（含自动抓取合并后的）
   console.log('[aggregation] Step 1: Loading sources...');
   const raw = await storage.get(KV_MANUAL_SOURCES);
   const sources: SourceEntry[] = raw ? JSON.parse(raw) : [];
@@ -79,9 +112,24 @@ async function _runAggregation(storage: Storage, config: AppConfig, startTime: n
     }
   }
 
-  // Step 2: 批量 fetch 配置 JSON
+  // Step 2: 批量 fetch 配置 JSON（本地模式可通过边缘代理回退）
   console.log('[aggregation] Step 2: Fetching configs...');
-  const { configs: sourcedConfigs, fetchResults } = await fetchConfigs(remoteSources, config.fetchTimeoutMs);
+  let proxyConfig: FetchProxyConfig | undefined;
+  if (!config.workerBaseUrl) {
+    // 本地模式：读取边缘代理配置
+    const edgeRaw = await storage.get(KV_EDGE_PROXIES);
+    if (edgeRaw) {
+      const edge: EdgeProxyConfig = JSON.parse(edgeRaw);
+      const urls: string[] = [];
+      if (edge.cf) urls.push(`${edge.cf}/fetch-proxy`);
+      if (edge.vercel) urls.push(`${edge.vercel}/api/proxy`);
+      if (urls.length > 0) {
+        proxyConfig = { urls, token: config.adminToken };
+        console.log(`[aggregation] Edge proxies configured: ${urls.join(', ')}`);
+      }
+    }
+  }
+  const { configs: sourcedConfigs, fetchResults } = await fetchConfigs(remoteSources, config.fetchTimeoutMs, proxyConfig);
 
   // 更新源健康状态
   await updateSourceHealth(storage, fetchResults);
@@ -221,10 +269,19 @@ async function _runAggregation(storage: Storage, config: AppConfig, startTime: n
     console.log('[aggregation] Step 7: Skipping JAR rewrite (local mode)');
   }
 
-  // Step 7.5: CF 模式注入图片代理前缀
+  // Step 7.5: 注入图片代理前缀（CF 模式用自身，本地模式用边缘代理）
   if (config.workerBaseUrl) {
     merged.pic = `${config.workerBaseUrl.replace(/\/$/, '')}/img/`;
     console.log(`[aggregation] Step 7.5: Injected pic proxy: ${merged.pic}`);
+  } else {
+    const edgeRaw = await storage.get(KV_EDGE_PROXIES);
+    if (edgeRaw) {
+      const edge: EdgeProxyConfig = JSON.parse(edgeRaw);
+      if (edge.cf) {
+        merged.pic = `${edge.cf.replace(/\/$/, '')}/img/`;
+        console.log(`[aggregation] Step 7.5: Injected pic proxy via edge: ${merged.pic}`);
+      }
+    }
   }
 
   // Step 8: 存入存储
