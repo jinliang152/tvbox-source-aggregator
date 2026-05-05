@@ -717,8 +717,8 @@ export function createApp(deps: AppDeps): Hono {
     });
   });
 
-  // ─── MacCMS 边缘代理（仅 CF 版）──────────────────────
-  if (config.workerBaseUrl) {
+  // ─── MacCMS API 代理（CF 版 + 本地版）──────────────────────
+  if (config.workerBaseUrl || config.localBaseUrl) {
     app.all('/api/:key', async (c) => {
       const key = c.req.param('key');
       const raw = await storage.get(KV_MACCMS_SOURCES);
@@ -734,7 +734,9 @@ export function createApp(deps: AppDeps): Hono {
         const reqUrl = new URL(c.req.url);
         reqUrl.searchParams.forEach((v, k) => targetUrl.searchParams.set(k, v));
 
-        const resp = await fetch(targetUrl.toString());
+        const resp = await fetch(targetUrl.toString(), {
+          headers: { 'User-Agent': 'okhttp/3.12.0' },
+        });
         const data = await resp.json();
 
         return c.json(data, 200, {

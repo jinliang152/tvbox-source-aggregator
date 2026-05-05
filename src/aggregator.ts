@@ -438,7 +438,8 @@ async function processMacCMSSources(
     return [];
   }
 
-  const sites = macCMSToTVBoxSites(validEntries, config.workerBaseUrl, speedMap);
+  const proxyBaseUrl = config.workerBaseUrl || config.localBaseUrl;
+  const sites = macCMSToTVBoxSites(validEntries, proxyBaseUrl, speedMap);
   console.log(`[aggregation] Converted ${sites.length} MacCMS sources to TVBoxSites`);
 
   return [{
